@@ -1496,11 +1496,38 @@ function parseCryptoCsvRow(row, walletId, coins, accounts, wallets, walletLabelR
 // Returns the matched rule object (not just an account) so the caller can
 // apply either a single ledger account or a label (a multi-account contra
 // split). A counterparty-specific rule wins over a wildcard.
-function applyCryptoRule(tx, rules) {
+function applyCryptoRule(tx, rules, ctx) {
   if (tx.type === "Transfer" || tx.ledgerAccountId || (tx.ledgerSplits && tx.ledgerSplits.length)) return undefined;
+  // Filter-condition rules (auto-mapping) are user-defined for a whole filtered
+  // set, so they're the most explicit and take precedence.
+  const cond = rules.find((r) => Array.isArray(r.conditions) && r.conditions.length && r.labelId && matchesCryptoFilter(tx, r.conditions, ctx));
+  if (cond) return cond;
   const specific = tx.counterparty && rules.find((r) => r.type === tx.type && r.coinId === tx.coinId && r.counterparty === tx.counterparty);
   if (specific) return specific;
-  return rules.find((r) => r.type === tx.type && r.coinId === tx.coinId && !r.counterparty);
+  return rules.find((r) => r.type === tx.type && r.coinId === tx.coinId && !r.counterparty && !r.conditions);
+}
+
+// The patch that maps a transaction onto a label without posting - the same
+// resolution the importer and bulk "Label & post" use, so auto-mapping a
+// filtered set behaves identically. Returns null when the label can't apply yet
+// (no value) or doesn't fit the row's direction.
+function labelPatchFor(t, label, wallets, coins) {
+  if (!label) return null;
+  const coin = coins.find((c) => c.id === t.coinId);
+  const value = coinValue(t.quantity, t.perCoinPrice);
+  if (labelIsFullEntry(label)) {
+    const feLegs = resolveFullEntryLegs(label, value);
+    return feLegs ? { fullEntryLegs: feLegs, matchedLabelId: label.id } : null;
+  }
+  if (labelIsTransfer(label)) {
+    const dest = labelTransferDestWallet(label, wallets, t.walletId, coin);
+    if (!dest || dest.id === t.walletId) return null;
+    return { type: "Transfer", toWalletId: dest.id, ledgerLegs: undefined, ledgerAccountId: null, ledgerSplits: null, matchedLabelId: label.id };
+  }
+  const legs = resolveLabelLegs(label, t.type, value);
+  if (!legs) return null;
+  const lw = labelPostWallet(label, wallets, coin);
+  return { ledgerLegs: legs, ledgerAccountId: null, ledgerSplits: null, matchedLabelId: label.id, ...(lw ? { walletId: lw.id } : {}) };
 }
 
 // A label can carry the full journal entry (from the settlement sheet),
@@ -2212,7 +2239,7 @@ function buildCryptoTxsFromRows(rows, walletId, wallets, coins, accounts, existi
     const hash = `${tx.date}|${tx.type}|${tx.walletId}|${tx.coinId}|${tx.quantity}|${tx.perCoinPrice}|${tx.txHash || ""}`;
     if (existingHashes.has(hash)) { dupes++; return; }
     existingHashes.add(hash);
-    const rule = applyCryptoRule(tx, rules);
+    const rule = applyCryptoRule(tx, rules, { coins: workingCoins, wallets });
     if (rule) {
       if (rule.labelId) {
         const label = cryptoLabels.find((l) => l.id === rule.labelId && l.status !== "inactive");
@@ -3905,22 +3932,38 @@ function makeCryptoSellEvent(venue) {
 const STORAGE_KEY = "ledger-data";
 const TENANTS_STORAGE_KEY = "ledger-tenants";
 
+// Persistence prefers window.storage when the host provides it, and falls back
+// to the browser's localStorage - so a plain browser build (where window.storage
+// doesn't exist) still remembers data across reloads. What actually gets saved
+// per tenant is a config-only subset (see the save effect): setup like the chart
+// of accounts, coins, wallets, labels, rules and filters persists, while the
+// transaction lists intentionally reset each session.
 async function loadData(key) {
   try {
-    if (!window.storage) return null;
-    const res = await window.storage.get(key, false);
-    return res ? JSON.parse(res.value) : null;
-  } catch {
-    return null;
-  }
+    if (typeof window !== "undefined" && window.storage) {
+      const res = await window.storage.get(key, false);
+      if (res) return JSON.parse(res.value);
+    }
+  } catch { /* fall through to localStorage */ }
+  try {
+    if (typeof localStorage !== "undefined") {
+      const v = localStorage.getItem(key);
+      return v ? JSON.parse(v) : null;
+    }
+  } catch { /* ignore */ }
+  return null;
 }
 async function saveData(key, data) {
+  const json = JSON.stringify(data);
   try {
-    if (!window.storage) return;
-    await window.storage.set(key, JSON.stringify(data), false);
-  } catch {
-    /* best-effort */
-  }
+    if (typeof window !== "undefined" && window.storage) {
+      await window.storage.set(key, json, false);
+      return;
+    }
+  } catch { /* fall through to localStorage */ }
+  try {
+    if (typeof localStorage !== "undefined") localStorage.setItem(key, json);
+  } catch { /* best-effort */ }
 }
 
 // ---------- language / i18n ----------
@@ -4241,7 +4284,9 @@ function TenantWorkspace({ tenantId, tenantName, tenants, seed, hasCrypto, onSwi
         setWalletLabelRules(saved.walletLabelRules || []);
         // `?? defaults` so a tenant saved before this feature (no gasTanks key)
         // gets the four BitGo tanks; a saved [] (user deleted them) stays empty.
-        setGasTanks(saved.gasTanks ?? DEFAULT_GAS_TANKS);
+        // Sync cursors reset each session (the txs they tracked didn't persist),
+        // so a fresh Sync re-fetches from the start.
+        setGasTanks((saved.gasTanks ?? DEFAULT_GAS_TANKS).map((g) => ({ ...g, cursor: 0, lastSyncedAt: 0 })));
         // explorerKeys are loaded separately from localStorage (see below), not
         // from this window.storage blob, so they persist across reloads.
         setRevaluations(saved.revaluations || []);
@@ -4254,8 +4299,17 @@ function TenantWorkspace({ tenantId, tenantName, tenants, seed, hasCrypto, onSwi
 
   useEffect(() => {
     if (!ready) return;
-    saveData(storageKey, { accounts, entities, transactions, rules, events, registry, coins, wallets, cryptoTxs, cryptoRules, cryptoLabels, cryptoFilters, walletLabelRules, gasTanks, revaluations, lockDate });
-  }, [storageKey, accounts, entities, transactions, rules, events, registry, coins, wallets, cryptoTxs, cryptoRules, cryptoLabels, cryptoFilters, walletLabelRules, gasTanks, revaluations, lockDate, ready]);
+    // Config only - the setup that's tedious to redo. The transaction lists
+    // (transactions, cryptoTxs, events, revaluations) are deliberately excluded
+    // so they reset each session; imports/syncs bring them back. Gas-tank sync
+    // cursors are stripped so a fresh session re-fetches (its txs didn't persist).
+    saveData(storageKey, {
+      accounts, entities, rules, registry, coins, wallets,
+      cryptoRules, cryptoLabels, cryptoFilters, walletLabelRules,
+      gasTanks: gasTanks.map((g) => ({ id: g.id, name: g.name, chain: g.chain, address: g.address, walletId: g.walletId })),
+      lockDate,
+    });
+  }, [storageKey, accounts, entities, rules, registry, coins, wallets, cryptoRules, cryptoLabels, cryptoFilters, walletLabelRules, gasTanks, lockDate, ready]);
 
   // API keys are the one thing that should survive a reload (they're annoying to
   // re-enter), even though transactions and other books intentionally don't.
@@ -4853,6 +4907,56 @@ function TenantWorkspace({ tenantId, tenantName, tenants, seed, hasCrypto, onSwi
       { id: uid("crule"), type, coinId, labelId, counterparty },
     ]);
   }
+  // Auto-mapping rule: map every transaction matching a set of filter conditions
+  // to a label. Applied to existing unmapped drafts (via the effect below) and to
+  // future imports (applyCryptoRule). Replaces any rule with the same conditions.
+  function addAutoMapRule(conditions, labelId, filterName) {
+    const clean = (conditions || []).filter((c) => c.value !== undefined && c.value !== "");
+    if (!clean.length || !labelId) return;
+    const key = JSON.stringify(clean);
+    setCryptoRules((prev) => [
+      ...prev.filter((r) => !(Array.isArray(r.conditions) && JSON.stringify(r.conditions) === key)),
+      { id: uid("crule"), conditions: clean, labelId, filterName },
+    ]);
+  }
+  function deleteCryptoRule(id) {
+    setCryptoRules((prev) => prev.filter((r) => r.id !== id));
+  }
+  // Apply condition-based auto-map rules to unmapped, unposted drafts. Only fills
+  // rows that have no label/account yet, so it never overrides a manual choice
+  // and (being idempotent) never loops.
+  useEffect(() => {
+    if (!ready) return;
+    const condRules = cryptoRules.filter((r) => Array.isArray(r.conditions) && r.conditions.length && r.labelId);
+    if (!condRules.length) return;
+    setCryptoTxs((prev) => {
+      let changed = false;
+      const next = prev.map((t) => {
+        // Skip anything already fully resolved or posted.
+        if (t.posted || t.ledgerAccountId || (t.ledgerLegs && t.ledgerLegs.length) || (t.type === "Transfer" && t.toWalletId)) return t;
+        // Use an already-assigned rule label, or find a rule matching this row.
+        let labelId = t.matchedLabelId;
+        if (!labelId) {
+          const rule = condRules.find((r) => matchesCryptoFilter(t, r.conditions, { coins, wallets }));
+          if (rule) labelId = rule.labelId;
+        }
+        if (!labelId) return t;
+        const label = cryptoLabels.find((l) => l.id === labelId && l.status !== "inactive");
+        if (!label) return t;
+        const patch = labelPatchFor(t, label, wallets, coins);
+        if (patch) { changed = true; return { ...t, ...patch, matchedByRule: true }; }
+        // Legs couldn't resolve. If the blocker is just a missing price (value
+        // not known yet - common for gas fees), still assign the label so the row
+        // shows as mapped; the legs resolve here automatically once the price
+        // lands (via the rate backfill). If value is known but the label doesn't
+        // fit the row's direction, leave it for manual handling.
+        const valueKnown = coinValue(t.quantity, t.perCoinPrice) > 0;
+        if (!valueKnown && t.matchedLabelId !== labelId) { changed = true; return { ...t, matchedLabelId: labelId, matchedByRule: true }; }
+        return t;
+      });
+      return changed ? next : prev;
+    });
+  }, [cryptoRules, cryptoTxs, cryptoLabels, coins, wallets, ready]);
   // Crypto label mapping CRUD (the crypto half of the unified Label Mapping).
   function addCryptoLabel(label) {
     const id = uid("clbl");
@@ -4897,6 +5001,16 @@ function TenantWorkspace({ tenantId, tenantName, tenants, seed, hasCrypto, onSwi
     const attempt = computeCryptoLedger(cryptoTxs, wallets, accounts, coins);
     setCryptoTxs((prev) =>
       prev.map((t) => (!t.posted && !isLocked(t.date) && attempt.linesByTx.has(t.id) ? { ...t, posted: true } : t))
+    );
+  }
+  // Post a specific set of already-resolved (ready-to-build) drafts at once -
+  // the "Post all" action on the Ready to build list. Same guards as
+  // buildJournals: never posts an unresolved row or one in a locked period.
+  function postResolvedDrafts(ids) {
+    const idSet = new Set(ids);
+    const attempt = computeCryptoLedger(cryptoTxs, wallets, accounts, coins);
+    setCryptoTxs((prev) =>
+      prev.map((t) => (idSet.has(t.id) && !t.posted && !isLocked(t.date) && attempt.linesByTx.has(t.id) ? { ...t, posted: true } : t))
     );
   }
   // Book a period-end revaluation. Kept sequential (a new one must be dated
@@ -5051,6 +5165,12 @@ function TenantWorkspace({ tenantId, tenantName, tenants, seed, hasCrypto, onSwi
             onAddCryptoLabel={addCryptoLabel}
             onUpdateCryptoLabel={updateCryptoLabel}
             onDeleteCryptoLabel={deleteCryptoLabel}
+            cryptoRules={cryptoRules}
+            cryptoFilters={cryptoFilters}
+            coins={coins}
+            wallets={wallets}
+            onAddRule={addAutoMapRule}
+            onDeleteRule={deleteCryptoRule}
           />
         )}
         {hasCrypto && tab === "coins" && (
@@ -5083,6 +5203,7 @@ function TenantWorkspace({ tenantId, tenantName, tenants, seed, hasCrypto, onSwi
             onUpdate={updateCryptoTx}
             onDelete={deleteCryptoTx}
             onBuildJournals={buildJournals}
+            onPostReady={postResolvedDrafts}
             onLoadSample={loadSampleCryptoTxs}
             onImportCsv={importCryptoCsvHandler}
             onPostOne={postCryptoTx}
@@ -5090,6 +5211,7 @@ function TenantWorkspace({ tenantId, tenantName, tenants, seed, hasCrypto, onSwi
             onBulkLabelPost={bulkLabelAndPost}
             onRemember={rememberCryptoRule}
             onRememberLabel={rememberCryptoLabelRule}
+            onAutoMapFilter={addAutoMapRule}
           />
         )}
         {hasCrypto && tab === "revaluation" && (
@@ -6894,8 +7016,34 @@ function legLabel(leg) {
   return `${prefix} ${leg.accountRef} (${pct === 100 ? baseField : `${pct}% of ${baseField}`})`;
 }
 
-function TransactionTypes({ accounts, cryptoLabels = [], onAddCryptoLabel, onUpdateCryptoLabel, onDeleteCryptoLabel }) {
+function TransactionTypes({ accounts, cryptoLabels = [], onAddCryptoLabel, onUpdateCryptoLabel, onDeleteCryptoLabel, cryptoRules = [], cryptoFilters = [], coins = [], wallets = [], onAddRule, onDeleteRule }) {
   const { t } = useLang();
+  const autoMapRules = cryptoRules.filter((r) => Array.isArray(r.conditions) && r.conditions.length && r.labelId);
+  const activeCryptoLabels = cryptoLabels.filter((l) => l.status !== "inactive");
+  // Rule builder: match a saved filter (favorite) to a label. The filter's
+  // conditions become the rule's conditions.
+  const [rFilterId, setRFilterId] = useState("");
+  const [rLabel, setRLabel] = useState("");
+  const selectedFilter = cryptoFilters.find((f) => f.id === rFilterId);
+  const canAddRule = selectedFilter && (selectedFilter.conditions || []).length > 0 && rLabel && onAddRule;
+  function addRule() {
+    if (!canAddRule) return;
+    onAddRule(selectedFilter.conditions, rLabel, selectedFilter.name);
+    setRFilterId(""); setRLabel("");
+  }
+  const condText = (c) => {
+    switch (c.field) {
+      case "type": return `Type is ${c.value}`;
+      case "source": return `Source is ${cryptoSourceLabel(c.value)}`;
+      case "coin": return `Coin is ${coins.find((x) => x.id === c.value)?.symbol || c.value}`;
+      case "wallet": return `Wallet is ${wallets.find((x) => x.id === c.value)?.name || c.value}`;
+      case "label": return `Label is ${cryptoLabels.find((x) => x.id === c.value)?.label || c.value}`;
+      case "dateFrom": return `On/after ${c.value}`;
+      case "dateTo": return `On/before ${c.value}`;
+      case "search": return `Text contains "${c.value}"`;
+      default: return `${c.field}=${c.value}`;
+    }
+  };
   return (
     <div className="p-6 max-w-4xl">
       <h1 className="text-xl font-semibold text-black mb-1">{t("title_types")}</h1>
@@ -6907,6 +7055,69 @@ function TransactionTypes({ accounts, cryptoLabels = [], onAddCryptoLabel, onUpd
           <p><span className="font-medium">Fees from a gas tank.</span> A gas tank is the company gas wallet (112106), holding each chain's native coin. Coin in = a Deposit (cost basis); coin out + network gas = a Fee, posted via "Gas fee paid from gas tank": Dr Gas fee (520301), Cr the gas wallet at FIFO cost. Avalanche and Polygon carry an on-chain price; set an ETH and TRX market rate so those fees carry a USD value.</p>
         </div>
       </details>
+
+      {/* Auto-mapping rules: filter conditions -> label, applied automatically
+          to matching transactions. Created from the Crypto Transactions filter
+          ("Auto-map every transaction matching this filter to a label"). */}
+      <div className="bg-white border border-stone-200 rounded-lg p-4 mb-5 shadow-sm">
+        <div className="text-xs font-medium uppercase tracking-wide text-slate-400 mb-1">Auto-mapping rules</div>
+        <p className="text-xs text-slate-500 mb-3">
+          Match a saved filter to a label: every transaction matching that filter is mapped to the label automatically - both existing drafts in Needs Review and future imports. Save filters on the Crypto Transactions screen (Save favorite).
+        </p>
+        {cryptoFilters.length === 0 ? (
+          <div className="text-xs text-slate-400 mb-4 pb-4 border-b border-stone-100">No saved filters yet - create one on the Crypto Transactions screen (filter, then "Save favorite"), then match it to a label here.</div>
+        ) : (
+          <div className="flex flex-wrap items-end gap-2 mb-2">
+            <div className="flex-1 min-w-[200px]">
+              <label className="block text-[11px] text-slate-500 mb-1">Saved filter</label>
+              <select value={rFilterId} onChange={(e) => setRFilterId(e.target.value)} className="w-full border border-stone-300 rounded px-2 py-1.5 text-sm">
+                <option value="">choose filter…</option>
+                {cryptoFilters.map((f) => <option key={f.id} value={f.id}>{f.name}</option>)}
+              </select>
+            </div>
+            <span className="text-slate-400 pb-2">→</span>
+            <div className="flex-1 min-w-[200px]">
+              <label className="block text-[11px] text-slate-500 mb-1">Label</label>
+              <select value={rLabel} onChange={(e) => setRLabel(e.target.value)} className="w-full border border-stone-300 rounded px-2 py-1.5 text-sm">
+                <option value="">choose label…</option>
+                {activeCryptoLabels.map((l) => <option key={l.id} value={l.id}>{l.label}</option>)}
+              </select>
+            </div>
+            <button onClick={addRule} disabled={!canAddRule}
+              className="flex items-center gap-1.5 bg-black enabled:hover:bg-[#4D4D4D] disabled:opacity-40 text-white text-sm px-3 py-1.5 rounded-full">
+              <Plus size={14} /> Add rule
+            </button>
+          </div>
+        )}
+        {selectedFilter && (
+          <div className="flex flex-wrap items-center gap-1 mb-4 pb-4 border-b border-stone-100 text-xs text-slate-500">
+            <span className="text-slate-400">Matches:</span>
+            {(selectedFilter.conditions || []).map((c, i) => <span key={i} className="bg-stone-100 text-slate-600 rounded px-1.5 py-0.5">{condText(c)}</span>)}
+          </div>
+        )}
+        {autoMapRules.length === 0 ? (
+          <div className="text-xs text-slate-400">No auto-mapping rules yet.</div>
+        ) : (
+          <div className="divide-y divide-stone-100">
+            {autoMapRules.map((r) => (
+              <div key={r.id} className="flex items-center gap-2 py-2 text-sm">
+                <div className="flex-1 min-w-0 flex flex-wrap items-center gap-1">
+                  {r.filterName && <span className="text-xs font-medium text-slate-700">{r.filterName}</span>}
+                  {r.conditions.map((c, i) => (
+                    <span key={i} className="text-xs bg-stone-100 text-slate-600 rounded px-1.5 py-0.5">{condText(c)}</span>
+                  ))}
+                  <span className="text-slate-400 mx-1">→</span>
+                  <span className="text-xs font-medium text-[#02B169]">{cryptoLabels.find((l) => l.id === r.labelId)?.label || "(deleted label)"}</span>
+                </div>
+                {onDeleteRule && (
+                  <button onClick={() => onDeleteRule(r.id)} className="text-slate-300 hover:text-[#B91C1C] shrink-0" title="Remove rule"><Trash2 size={14} /></button>
+                )}
+              </div>
+            ))}
+          </div>
+        )}
+      </div>
+
       <CryptoLabelManager
         accounts={accounts}
         cryptoLabels={cryptoLabels}
@@ -8089,7 +8300,7 @@ function WalletsScreen({ wallets, accounts, onAdd, onUpdate, onDelete }) {
 
 // ---------- Crypto Transactions ----------
 
-function CryptoTransactions({ cryptoTxs, coins, wallets, accounts, cryptoLedger, cryptoRules, cryptoLabels = [], cryptoFilters = [], onAddFilter, onDeleteFilter, walletLabelRules, onAdd, onUpdate, onDelete, onBuildJournals, onLoadSample, onImportCsv, onPostOne, onBulkPost, onBulkLabelPost, onRemember, onRememberLabel }) {
+function CryptoTransactions({ cryptoTxs, coins, wallets, accounts, cryptoLedger, cryptoRules, cryptoLabels = [], cryptoFilters = [], onAddFilter, onDeleteFilter, walletLabelRules, onAdd, onUpdate, onDelete, onBuildJournals, onPostReady, onLoadSample, onImportCsv, onPostOne, onBulkPost, onBulkLabelPost, onRemember, onRememberLabel, onAutoMapFilter }) {
   const { t } = useLang();
   const [showForm, setShowForm] = useState(false);
   const [subTab, setSubTab] = useState("import");
@@ -8639,16 +8850,6 @@ function CryptoTransactions({ cryptoTxs, coins, wallets, accounts, cryptoLedger,
                   </>
                 )}
               </div>
-              {canCreateRule && activeCryptoLabels.length > 0 && onRememberLabel && (
-                <div className="flex items-center gap-2 mt-2 pt-2 border-t border-stone-100 text-xs">
-                  <span className="text-slate-500">Create a label rule from this filter: {ruleTypeCond.value} · {coins.find((x) => x.id === ruleCoinCond.value)?.symbol || ""} →</span>
-                  <select value="" onChange={(e) => { if (e.target.value) createLabelRule(e.target.value); }}
-                    className="border border-stone-300 rounded px-2 py-1 text-xs">
-                    <option value="">choose label…</option>
-                    {activeCryptoLabels.map((l) => <option key={l.id} value={l.id}>{l.label}</option>)}
-                  </select>
-                </div>
-              )}
             </div>
           )}
 
@@ -8968,7 +9169,15 @@ function CryptoTransactions({ cryptoTxs, coins, wallets, accounts, cryptoLedger,
 
           {coaFilter !== "incomplete" && (
           <>
-          <div className="mb-2 text-xs font-semibold uppercase tracking-wide text-slate-400">Ready to build ({readyDrafts.length})</div>
+          <div className="flex items-center justify-between mb-2">
+            <div className="text-xs font-semibold uppercase tracking-wide text-slate-400">Ready to build ({readyDrafts.length})</div>
+            {readyDrafts.length > 0 && onPostReady && (
+              <button onClick={() => onPostReady(readyDrafts.map((t) => t.id))}
+                className="flex items-center gap-1.5 bg-black hover:bg-[#4D4D4D] text-white text-xs px-3 py-1.5 rounded-full">
+                <CheckCircle2 size={13} /> Post all ({readyDrafts.length})
+              </button>
+            )}
+          </div>
           <div className="bg-white border border-stone-200 rounded-lg shadow-sm mb-6 overflow-hidden">
             {readyDrafts.length === 0 && <div className="p-4 text-sm text-slate-400">Nothing ready yet - resolve items in Needs review, or add a transaction above.</div>}
             {readyDrafts.map((t) => {
