@@ -5089,6 +5089,7 @@ function TenantWorkspace({ tenantId, tenantName, tenants, seed, hasCrypto, onSwi
             isLocked={isLocked}
             onBook={bookRevaluation}
             onDelete={deleteRevaluation}
+            onRefreshRates={refreshLiveRates}
           />
         )}
         {tab === "ledger" && <LedgerView accounts={accounts} journal={journal} focusAccountId={ledgerFocusAccountId} />}
@@ -9696,11 +9697,21 @@ function LedgerConnectionScreen({ accounts, journal, onImportOpeningBalances }) 
 
 // ---------- Revaluation (period-end mark-to-market) ----------
 
-function RevaluationScreen({ cryptoTxs, wallets, accounts, coins, revaluations, lockDate, isLocked, onBook, onDelete }) {
+function RevaluationScreen({ cryptoTxs, wallets, accounts, coins, revaluations, lockDate, isLocked, onBook, onDelete, onRefreshRates }) {
   const { t } = useLang();
   const [date, setDate] = useState(todayStr());
-  const [markPrices, setMarkPrices] = useState({}); // coinId -> string override
+  const [markPrices, setMarkPrices] = useState({}); // coinId -> string override (blank = use the live rate)
   const [result, setResult] = useState(null);
+  // Mark prices default to each coin's live market rate. Refresh those rates
+  // when this screen opens so the marks are current without any manual entry.
+  const [refreshing, setRefreshing] = useState(false);
+  async function refreshMarks() {
+    if (!onRefreshRates) return;
+    setRefreshing(true);
+    try { await onRefreshRates(); } catch { /* keep existing rates */ }
+    finally { setRefreshing(false); }
+  }
+  useEffect(() => { refreshMarks(); /* eslint-disable-next-line react-hooks/exhaustive-deps */ }, []);
 
   const { gainAccountId, lossAccountId } = resolveUnrealizedAccounts(accounts);
   const hasAccounts = !!gainAccountId && !!lossAccountId;
@@ -9764,7 +9775,14 @@ function RevaluationScreen({ cryptoTxs, wallets, accounts, coins, revaluations, 
           </div>
           {coinsInView.length > 0 && (
             <div className="flex-1 min-w-[240px]">
-              <label className="block text-xs text-slate-500 mb-1">Mark prices (USD)</label>
+              <label className="flex items-center gap-1.5 text-xs text-slate-500 mb-1">
+                Mark prices (USD)
+                <span className="text-slate-400">· live</span>
+                <button type="button" onClick={refreshMarks} disabled={refreshing} title="Refresh live prices"
+                  className="text-slate-400 hover:text-slate-600 disabled:opacity-40">
+                  <RefreshCw size={11} className={refreshing ? "animate-spin" : ""} />
+                </button>
+              </label>
               <div className="flex flex-wrap gap-2">
                 {coinsInView.map((c) => (
                   <div key={c.coinId} className="flex items-center gap-1">
@@ -9775,6 +9793,7 @@ function RevaluationScreen({ cryptoTxs, wallets, accounts, coins, revaluations, 
                   </div>
                 ))}
               </div>
+              <p className="text-[11px] text-slate-400 mt-1">Auto-filled from live market rates. Edit a value to override it for this revaluation.</p>
             </div>
           )}
           <button onClick={book} disabled={!canBook}
