@@ -4563,6 +4563,20 @@ function TenantWorkspace({ tenantId, tenantName, tenants, seed, hasCrypto, onSwi
   }
   // Pull live USD prices from CoinGecko and write them onto each mappable coin's
   // marketRate. Returns { updated, skipped } for the UI; throws on fetch failure.
+  // Fetch each symbol's USD price as of a specific date (historical), for the
+  // revaluation marks - historical-by-date via CoinGecko (with key) or Coinbase,
+  // falling back to the current price if that date isn't available. Returns a
+  // { symbol: price } map.
+  async function fetchDatedCoinPrices(symbols, isoDate) {
+    const out = {};
+    for (const sym of [...new Set(symbols)]) {
+      let p = null;
+      try { p = await fetchGasHistoricalPrice(sym, isoDate, explorerKeys.coingecko); } catch { p = null; }
+      if (!(p > 0)) { try { p = await fetchGasCurrentPrice(sym, explorerKeys.coingecko); } catch { p = 0; } }
+      if (p > 0) out[sym] = p;
+    }
+    return out;
+  }
   async function refreshLiveRates() {
     const { updates, skipped } = await fetchLiveCoinRates(coins, explorerKeys.coingecko);
     if (updates.length) setCoins((prev) => prev.map((c) => {
@@ -5047,9 +5061,9 @@ function TenantWorkspace({ tenantId, tenantName, tenants, seed, hasCrypto, onSwi
         )}
         {hasCrypto && tab === "gasTanks" && (
           <GasTanksScreen
-            gasTanks={gasTanks} wallets={wallets} explorerKeys={explorerKeys}
+            gasTanks={gasTanks} wallets={wallets}
             onAdd={addGasTank} onUpdate={updateGasTank} onRemove={removeGasTank}
-            onSetKeys={setExplorerKeys} onSync={syncGasTanks}
+            onSync={syncGasTanks}
           />
         )}
         {hasCrypto && tab === "cryptoTx" && (
@@ -5089,7 +5103,7 @@ function TenantWorkspace({ tenantId, tenantName, tenants, seed, hasCrypto, onSwi
             isLocked={isLocked}
             onBook={bookRevaluation}
             onDelete={deleteRevaluation}
-            onRefreshRates={refreshLiveRates}
+            onFetchDatedPrices={fetchDatedCoinPrices}
           />
         )}
         {tab === "ledger" && <LedgerView accounts={accounts} journal={journal} focusAccountId={ledgerFocusAccountId} />}
@@ -5112,7 +5126,7 @@ function TenantWorkspace({ tenantId, tenantName, tenants, seed, hasCrypto, onSwi
             onImportOpeningBalances={importOpeningBalances}
           />
         )}
-        {tab === "settings" && <SettingsScreen lockDate={lockDate} onSetLock={setLockDate} />}
+        {tab === "settings" && <SettingsScreen lockDate={lockDate} onSetLock={setLockDate} explorerKeys={explorerKeys} onSetKeys={setExplorerKeys} />}
       </div>
     </div>
   );
@@ -7704,7 +7718,7 @@ const COMPLIANCE_STATUSES = ["Verified", "Pending Review", "Flagged"];
 // EVM chains, TronScan for Tron), importing top-ups as Deposits and gas spends
 // as Fees. Each tank remembers a cursor (last block / timestamp) so Sync only
 // fetches new activity. Fetching runs in the browser and needs an API key.
-function GasTanksScreen({ gasTanks, wallets, explorerKeys, onAdd, onUpdate, onRemove, onSetKeys, onSync }) {
+function GasTanksScreen({ gasTanks, wallets, onAdd, onUpdate, onRemove, onSync }) {
   const { t } = useLang();
   const [busy, setBusy] = useState({});
   const [results, setResults] = useState({});
@@ -7787,30 +7801,7 @@ function GasTanksScreen({ gasTanks, wallets, explorerKeys, onAdd, onUpdate, onRe
   return (
     <div className="p-6 max-w-5xl">
       <h1 className="text-xl font-semibold text-black mb-1">{t("title_gasTanks")}</h1>
-      <p className="text-sm text-slate-500 mb-5">{t("subtitle_gasTanks")}</p>
-
-      {/* API keys */}
-      <div className="bg-white border border-stone-200 rounded-lg p-4 mb-6 shadow-sm">
-        <div className="text-xs font-medium uppercase tracking-wide text-slate-400 mb-3">Block-explorer API keys</div>
-        <div className="flex flex-wrap gap-4 items-end">
-          <div className="flex-1 min-w-[260px]">
-            <label className="block text-xs text-slate-500 mb-1">Etherscan API key <span className="text-slate-400">(covers ETH, Polygon, Avalanche)</span></label>
-            <input type="password" value={explorerKeys.etherscan || ""} onChange={(e) => onSetKeys({ ...explorerKeys, etherscan: e.target.value.trim() })}
-              placeholder="Free key from etherscan.io/apis" className="w-full border border-stone-300 rounded px-2 py-1.5 text-sm font-mono" />
-          </div>
-          <div className="flex-1 min-w-[260px]">
-            <label className="block text-xs text-slate-500 mb-1">TronScan API key <span className="text-slate-400">(optional, for TRX)</span></label>
-            <input type="password" value={explorerKeys.tronscan || ""} onChange={(e) => onSetKeys({ ...explorerKeys, tronscan: e.target.value.trim() })}
-              placeholder="Optional - from tronscan.org" className="w-full border border-stone-300 rounded px-2 py-1.5 text-sm font-mono" />
-          </div>
-          <div className="flex-1 min-w-[260px]">
-            <label className="block text-xs text-slate-500 mb-1">CoinGecko API key <span className="text-slate-400">(for coin prices)</span></label>
-            <input type="password" value={explorerKeys.coingecko || ""} onChange={(e) => onSetKeys({ ...explorerKeys, coingecko: e.target.value.trim() })}
-              placeholder="Free Demo key from coingecko.com" className="w-full border border-stone-300 rounded px-2 py-1.5 text-sm font-mono" />
-          </div>
-        </div>
-        <p className="text-xs text-slate-400 mt-2">Keys are saved with this company and reused every time - enter them once. Prices come from CoinGecko when its key is set (covers every coin incl. TRX), otherwise from Coinbase (keyless, major coins only). If a fetch is blocked (network/CORS), export the CSV from the explorer and use the Import screen instead.</p>
-      </div>
+      <p className="text-sm text-slate-500 mb-5">{t("subtitle_gasTanks")} API keys are set in Settings.</p>
 
       {/* Tank list */}
       <div className="flex items-center justify-between mb-2">
@@ -9697,29 +9688,24 @@ function LedgerConnectionScreen({ accounts, journal, onImportOpeningBalances }) 
 
 // ---------- Revaluation (period-end mark-to-market) ----------
 
-function RevaluationScreen({ cryptoTxs, wallets, accounts, coins, revaluations, lockDate, isLocked, onBook, onDelete, onRefreshRates }) {
+function RevaluationScreen({ cryptoTxs, wallets, accounts, coins, revaluations, lockDate, isLocked, onBook, onDelete, onFetchDatedPrices }) {
   const { t } = useLang();
   const [date, setDate] = useState(todayStr());
-  const [markPrices, setMarkPrices] = useState({}); // coinId -> string override (blank = use the live rate)
+  const [markPrices, setMarkPrices] = useState({}); // coinId -> string user override (blank = use the fetched mark)
+  const [histPrices, setHistPrices] = useState({}); // coinId -> price fetched for the selected date
   const [result, setResult] = useState(null);
-  // Mark prices default to each coin's live market rate. Refresh those rates
-  // when this screen opens so the marks are current without any manual entry.
-  const [refreshing, setRefreshing] = useState(false);
-  async function refreshMarks() {
-    if (!onRefreshRates) return;
-    setRefreshing(true);
-    try { await onRefreshRates(); } catch { /* keep existing rates */ }
-    finally { setRefreshing(false); }
-  }
-  useEffect(() => { refreshMarks(); /* eslint-disable-next-line react-hooks/exhaustive-deps */ }, []);
+  const [loadingMarks, setLoadingMarks] = useState(false);
+  // The marks actually used: a user override wins, otherwise the price fetched
+  // for the revaluation date.
+  const effectiveMarks = { ...histPrices, ...markPrices };
 
   const { gainAccountId, lossAccountId } = resolveUnrealizedAccounts(accounts);
   const hasAccounts = !!gainAccountId && !!lossAccountId;
   const latest = revaluations.reduce((m, r) => (r.date > m ? r.date : m), "");
 
   const preview = useMemo(
-    () => computeRevaluation(cryptoTxs, wallets, accounts, coins, revaluations, date, markPrices),
-    [cryptoTxs, wallets, accounts, coins, revaluations, date, markPrices]
+    () => computeRevaluation(cryptoTxs, wallets, accounts, coins, revaluations, date, effectiveMarks),
+    [cryptoTxs, wallets, accounts, coins, revaluations, date, effectiveMarks]
   );
   const bookable = preview.filter((ln) => Math.abs(ln.adjustment) >= 0.005);
   const totalAdj = bookable.reduce((s, ln) => s + ln.adjustment, 0);
@@ -9730,6 +9716,23 @@ function RevaluationScreen({ cryptoTxs, wallets, accounts, coins, revaluations, 
   const seenCoins = new Set();
   preview.forEach((ln) => { if (!seenCoins.has(ln.coinId)) { seenCoins.add(ln.coinId); coinsInView.push({ coinId: ln.coinId, symbol: ln.symbol }); } });
 
+  // Auto-fetch each coin's price as of the selected revaluation date. Which
+  // coins are in view doesn't depend on price, so this doesn't loop. A change of
+  // date also drops manual overrides so the marks re-default to that date.
+  const symbolsKey = coinsInView.map((c) => c.symbol).join(",");
+  async function fetchMarks() {
+    if (!onFetchDatedPrices || !date || coinsInView.length === 0) return;
+    setLoadingMarks(true);
+    try {
+      const bySym = await onFetchDatedPrices(coinsInView.map((c) => c.symbol), date);
+      const byCoin = {};
+      coinsInView.forEach((c) => { if (bySym[c.symbol] != null) byCoin[c.coinId] = String(bySym[c.symbol]); });
+      setHistPrices(byCoin);
+    } catch { /* keep whatever we have */ }
+    finally { setLoadingMarks(false); }
+  }
+  useEffect(() => { fetchMarks(); /* eslint-disable-next-line react-hooks/exhaustive-deps */ }, [date, symbolsKey]);
+
   const dateAfterLatest = !latest || date > latest;
   const locked = isLocked(date);
   const canBook = hasAccounts && dateAfterLatest && !locked && bookable.length > 0;
@@ -9738,13 +9741,13 @@ function RevaluationScreen({ cryptoTxs, wallets, accounts, coins, revaluations, 
   const walletName = (id) => wallets.find((w) => w.id === id)?.name || "-";
   const markValue = (coinId) => {
     const coin = coins.find((c) => c.id === coinId);
-    return markPrices[coinId] !== undefined ? markPrices[coinId] : (coin?.marketRate ?? "");
+    return effectiveMarks[coinId] !== undefined ? effectiveMarks[coinId] : (coin?.marketRate ?? "");
   };
 
   function book() {
-    const r = onBook(date, markPrices);
+    const r = onBook(date, effectiveMarks);
     setResult(r);
-    if (r.ok) setMarkPrices({});
+    if (r.ok) { setMarkPrices({}); setHistPrices({}); }
   }
 
   const pastRevals = revaluations.slice().sort((a, b) => b.date.localeCompare(a.date));
@@ -9769,7 +9772,7 @@ function RevaluationScreen({ cryptoTxs, wallets, accounts, coins, revaluations, 
         <div className="flex flex-wrap items-end gap-4">
           <div>
             <label className="block text-xs text-slate-500 mb-1">Revaluation date</label>
-            <DateField value={date} onChange={(v) => { setDate(v); setResult(null); }}
+            <DateField value={date} onChange={(v) => { setDate(v); setResult(null); setMarkPrices({}); setHistPrices({}); }}
               className="border border-stone-300 rounded px-2 py-1.5 text-sm w-32" />
             {!dateAfterLatest && <div className="text-[11px] text-[#B45309] mt-1">Must be after the last revaluation ({latest}).</div>}
           </div>
@@ -9777,10 +9780,10 @@ function RevaluationScreen({ cryptoTxs, wallets, accounts, coins, revaluations, 
             <div className="flex-1 min-w-[240px]">
               <label className="flex items-center gap-1.5 text-xs text-slate-500 mb-1">
                 Mark prices (USD)
-                <span className="text-slate-400">· live</span>
-                <button type="button" onClick={refreshMarks} disabled={refreshing} title="Refresh live prices"
+                <span className="text-slate-400">· as of {date}</span>
+                <button type="button" onClick={fetchMarks} disabled={loadingMarks} title="Re-fetch prices for this date"
                   className="text-slate-400 hover:text-slate-600 disabled:opacity-40">
-                  <RefreshCw size={11} className={refreshing ? "animate-spin" : ""} />
+                  <RefreshCw size={11} className={loadingMarks ? "animate-spin" : ""} />
                 </button>
               </label>
               <div className="flex flex-wrap gap-2">
@@ -9793,7 +9796,7 @@ function RevaluationScreen({ cryptoTxs, wallets, accounts, coins, revaluations, 
                   </div>
                 ))}
               </div>
-              <p className="text-[11px] text-slate-400 mt-1">Auto-filled from live market rates. Edit a value to override it for this revaluation.</p>
+              <p className="text-[11px] text-slate-400 mt-1">{loadingMarks ? "Fetching prices for this date…" : <>Auto-filled with each coin's market price on {date}. Edit a value to override it for this revaluation.</>}</p>
             </div>
           )}
           <button onClick={book} disabled={!canBook}
@@ -9890,14 +9893,41 @@ function RevaluationScreen({ cryptoTxs, wallets, accounts, coins, revaluations, 
 // any future personal/display setting that isn't part of a tenant's books
 // (same reasoning as putting language on LanguageContext instead of
 // per-tenant state).
-function SettingsScreen({ lockDate = "", onSetLock }) {
+function SettingsScreen({ lockDate = "", onSetLock, explorerKeys = { etherscan: "", tronscan: "", coingecko: "" }, onSetKeys }) {
   const { lang, t, setLang } = useLang();
   const [draftLock, setDraftLock] = useState(lockDate);
   useEffect(() => { setDraftLock(lockDate); }, [lockDate]);
+  const setKey = (k, v) => onSetKeys && onSetKeys({ ...explorerKeys, [k]: v.trim() });
   return (
     <div className="p-6 max-w-3xl">
       <h1 className="text-xl font-semibold text-black mb-1">{t("title_settings")}</h1>
       <p className="text-sm text-slate-500 mb-6">{t("subtitle_settings")}</p>
+
+      <div className="bg-white border border-stone-200 rounded-lg shadow-sm p-4 mb-4">
+        <h2 className="text-sm font-semibold text-black mb-1 flex items-center gap-1.5">
+          <SettingsIcon size={15} /> API keys
+        </h2>
+        <p className="text-xs text-slate-500 mb-3">
+          Used to fetch on-chain gas-tank activity and coin prices. Saved with this company and reused every time - enter them once. Prices come from CoinGecko when its key is set (covers every coin incl. TRX), otherwise from Coinbase (keyless, major coins only).
+        </p>
+        <div className="flex flex-wrap gap-4 items-end">
+          <div className="flex-1 min-w-[240px]">
+            <label className="block text-xs text-slate-500 mb-1">Etherscan API key <span className="text-slate-400">(covers ETH, Polygon, Avalanche)</span></label>
+            <input type="password" value={explorerKeys.etherscan || ""} onChange={(e) => setKey("etherscan", e.target.value)}
+              placeholder="Free key from etherscan.io/apis" className="w-full border border-stone-300 rounded px-2 py-1.5 text-sm font-mono" />
+          </div>
+          <div className="flex-1 min-w-[240px]">
+            <label className="block text-xs text-slate-500 mb-1">TronScan API key <span className="text-slate-400">(optional, for TRX)</span></label>
+            <input type="password" value={explorerKeys.tronscan || ""} onChange={(e) => setKey("tronscan", e.target.value)}
+              placeholder="Optional - from tronscan.org" className="w-full border border-stone-300 rounded px-2 py-1.5 text-sm font-mono" />
+          </div>
+          <div className="flex-1 min-w-[240px]">
+            <label className="block text-xs text-slate-500 mb-1">CoinGecko API key <span className="text-slate-400">(for coin prices)</span></label>
+            <input type="password" value={explorerKeys.coingecko || ""} onChange={(e) => setKey("coingecko", e.target.value)}
+              placeholder="Free Demo key from coingecko.com" className="w-full border border-stone-300 rounded px-2 py-1.5 text-sm font-mono" />
+          </div>
+        </div>
+      </div>
 
       <div className="bg-white border border-stone-200 rounded-lg shadow-sm p-4 mb-4">
         <h2 className="text-sm font-semibold text-black mb-1 flex items-center gap-1.5">
