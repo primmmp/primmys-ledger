@@ -1,0 +1,8 @@
+Date,Type,Coin,Quantity,Price,FeeQuantity,FeePerCoinPrice,ToWallet,LedgerAccount,Reference,TxHash
+2026-06-01,Deposit,USDT,100000,1,,,,310101,Initial USDT capital funding,0xcap0001
+2026-06-03,Transfer,USDT,20000,1,5,1,OKX spot - Company #Stablecoin,,Treasury transfer to OKX for margin funding,0xtxfr0001
+2026-06-05,Transfer,USDT,15000,1,3,1,Binance spot - Company #Stablecoin,,Treasury transfer to Binance for margin funding,0xtxfr0002
+2026-06-07,Withdrawal,USDT,5000,1,,,,140301,Converted to fiat for shareholder payout,0xwd0001
+2026-06-10,Transfer,USDT,3500,1,,,Bitgo gas wallet - Company,,Prepay gas from hot wallet to gas wallet,0xtxfr0003
+2026-06-12,Withdrawal,USDT,45.5,1,,,,520301,Gas fee paid directly from company hot wallet,0xwd0002
+2026-06-18,Deposit,USDT,8000,1,,,,210302,Client crypto deposit routed via company pooled wallet pending reallocation,0xdep0002

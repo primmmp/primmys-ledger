@@ -1,0 +1,14 @@
+# Large media / screen recordings (too big for GitHub's 100MB limit)
+*.mov
+*.mp4
+
+# macOS
+.DS_Store
+
+# Node / build artifacts
+node_modules/
+dist/
+build/
+
+# Local secrets - do not commit API keys
+API keys.md
