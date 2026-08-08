@@ -1356,15 +1356,18 @@ function resolveSourceWallet(row, wallets, walletLabelRules = []) {
 // without the tag, or no matching pair), the original wallet is kept - so this
 // only ever helps and never strands a row.
 function assetRoutedWallet(resolved, coin, wallets) {
-  if (!resolved || !coin || coin.assetType === "Fiat") return resolved;
-  const wantStable = coin.assetType === "Stablecoin";
+  if (!resolved || !coin || coin.assetType === "Fiat" || coin.isFiat) return resolved;
+  // Stablecoins (USDT/USDC) belong in a #Stablecoin wallet, other crypto in a
+  // #Crypto wallet. Swap the venue's tag to the wanted one - from any of
+  // #Crypto/#Stablecoin/#USD - so e.g. a USDT trade quote lands in Kraken
+  // #Stablecoin even when the base/quote wallet started as #USD.
+  const want = coin.assetType === "Stablecoin" ? "Stablecoin" : "Crypto";
   const name = resolved.name || "";
-  const hasStable = /#\s*stablecoin/i.test(name);
-  const hasCrypto = /#\s*crypto/i.test(name);
-  let target = null;
-  if (wantStable && hasCrypto && !hasStable) target = name.replace(/#\s*crypto/i, "#Stablecoin");
-  else if (!wantStable && hasStable && !hasCrypto) target = name.replace(/#\s*stablecoin/i, "#Crypto");
-  if (!target) return resolved;
+  const tagRe = /#\s*(crypto|stablecoin|usd)\b/i;
+  const m = name.match(tagRe);
+  if (!m) return resolved; // not a tagged venue wallet - leave as picked
+  if (new RegExp(want, "i").test(m[1])) return resolved; // already the right tag
+  const target = name.replace(tagRe, `#${want}`);
   const sibling = wallets.find((w) => w.name.toLowerCase() === target.toLowerCase());
   return sibling || resolved;
 }
@@ -1613,6 +1616,13 @@ function labelPatchFor(t, label, wallets, coins) {
   if (!label) return null;
   const coin = coins.find((c) => c.id === t.coinId);
   const value = coinValue(t.quantity, t.perCoinPrice);
+  // A trade label sets the acquired/disposed venue wallets (the engine supplies
+  // FIFO cost basis + gain/loss). Only applies to Trade rows.
+  if (labelIsTrade(label)) {
+    if (t.type !== "Trade") return null;
+    const p = labelTradeApply(label, wallets);
+    return p ? { ...p, matchedLabelId: label.id } : null;
+  }
   if (labelIsFullEntry(label)) {
     const feLegs = resolveFullEntryLegs(label, value);
     return feLegs ? { fullEntryLegs: feLegs, matchedLabelId: label.id } : null;
@@ -1787,13 +1797,22 @@ function labelPostWallet(label, wallets, coin) {
 // Where a crypto transaction came from, so Needs Review can be filtered by
 // origin when a Bitgo client-custody CSV and gas-tank syncs are mixed together.
 const CRYPTO_SOURCES = [
-  { value: "client", label: "Bitgo · Client wallet" },
-  { value: "gastank", label: "Bitgo · Gas tank" },
-  { value: "kraken", label: "Kraken" },
-  { value: "manual", label: "Manual entry" },
+  { value: "client", label: "Bitgo · Client wallet", short: "Client", party: "Client" },
+  { value: "gastank", label: "Bitgo · Gas tank", short: "Gas tank", party: "Company" },
+  { value: "kraken", label: "Kraken", short: "Kraken", party: "Company" },
+  { value: "manual", label: "Manual entry", short: "Manual", party: "Company" },
 ];
 function cryptoSourceLabel(src) {
   return CRYPTO_SOURCES.find((s) => s.value === src)?.label || (src || "Manual entry");
+}
+function cryptoSourceShort(src) {
+  return CRYPTO_SOURCES.find((s) => s.value === src)?.short || (src || "Manual");
+}
+// Whose funds a source represents: client custody vs Money Buddy's own. Exchange
+// activity (Kraken and future exchanges) and gas tanks are Company; only the
+// Bitgo client wallet is Client.
+function cryptoSourceParty(src) {
+  return CRYPTO_SOURCES.find((s) => s.value === src)?.party || "Company";
 }
 
 function matchesCryptoFilter(tx, conditions, ctx) {
@@ -4942,9 +4961,11 @@ function TenantWorkspace({ tenantId, tenantName, tenants, seed, hasCrypto, onSwi
     const url = (explorerKeys.krakenUrl || "").trim();
     const token = (explorerKeys.krakenToken || "").trim();
     if (!url) return { error: "Set the Kraken proxy URL in Settings › Crypto first." };
-    // Land Kraken activity on a Kraken venue wallet if there is one, else a
-    // company crypto wallet (the trade importer re-routes the crypto side).
-    const fallback = wallets.find((w) => /kraken/i.test(w.name))
+    // Land Kraken activity on the Kraken #Crypto wallet if there is one (so the
+    // asset router can swap to #Stablecoin/#USD by coin), then any Kraken wallet,
+    // then a company crypto wallet.
+    const fallback = wallets.find((w) => /kraken/i.test(w.name) && /#\s*crypto/i.test(w.name))
+      || wallets.find((w) => /kraken/i.test(w.name))
       || wallets.find((w) => /#\s*crypto/i.test(w.name) && /company/i.test(w.name) && !/client/i.test(w.name))
       || wallets.find((w) => !w.isBank) || wallets[0];
     if (!fallback) return { error: "No wallet available to import Kraken activity into." };
@@ -5210,7 +5231,12 @@ function TenantWorkspace({ tenantId, tenantName, tenants, seed, hasCrypto, onSwi
         const label = cryptoLabels.find((l) => l.id === labelId && l.status !== "inactive");
         if (!label) return t;
         const patch = labelPatchFor(t, label, wallets, coins);
-        if (patch) { changed = true; return { ...t, ...patch, matchedByRule: true }; }
+        if (patch) {
+          // Skip if it changes nothing (e.g. a Trade the importer already
+          // mapped) - otherwise re-applying an identical patch loops forever.
+          if (Object.keys(patch).every((k) => t[k] === patch[k]) && t.matchedByRule) return t;
+          changed = true; return { ...t, ...patch, matchedByRule: true };
+        }
         // Legs couldn't resolve. If the blocker is just a missing price (value
         // not known yet - common for gas fees), still assign the label so the row
         // shows as mapped; the legs resolve here automatically once the price
@@ -9367,9 +9393,9 @@ function CryptoTransactions({ cryptoTxs, coins, wallets, accounts, cryptoLedger,
               const summary = (
                 <span className="flex-1 min-w-0 flex items-center gap-2">
                   {t.source && t.source !== "manual" && (
-                    <span className={`shrink-0 text-[10px] uppercase tracking-wide px-1.5 py-0.5 rounded ${t.source === "gastank" ? "bg-[#EEF2FF] text-[#4338CA]" : "bg-[#ECFDF5] text-[#047857]"}`}
-                      title={cryptoSourceLabel(t.source)}>
-                      {t.source === "gastank" ? "Gas tank" : "Client"}
+                    <span className={`shrink-0 text-[10px] uppercase tracking-wide px-1.5 py-0.5 rounded ${cryptoSourceParty(t.source) === "Client" ? "bg-[#FEF3C7] text-[#92400E]" : "bg-[#EEF2FF] text-[#4338CA]"}`}
+                      title={`${cryptoSourceLabel(t.source)} · ${cryptoSourceParty(t.source)}`}>
+                      {cryptoSourceShort(t.source)} · {cryptoSourceParty(t.source)}
                     </span>
                   )}
                   <span className="truncate">
