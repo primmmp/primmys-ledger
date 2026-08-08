@@ -2697,10 +2697,21 @@ async function fetchKrakenProxy(proxyUrl, token, method, params) {
   return j.result || {};
 }
 // Page through a Kraken history endpoint (offset-based) until all rows are in.
+// Kraken rate-limits history calls hard (each page costs ~4 of ~15-20 counter
+// points, refilled ~0.33-0.5/sec), so pages are spaced out to avoid a rate-limit
+// lockout, and a rate-limit error backs off and retries rather than failing.
 async function fetchKrakenAll(proxyUrl, token, method, key) {
-  let ofs = 0, all = {}, guard = 0;
-  while (guard++ < 60) {
-    const result = await fetchKrakenProxy(proxyUrl, token, method, { ofs });
+  const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+  let ofs = 0, all = {}, guard = 0, first = true;
+  while (guard++ < 80) {
+    if (!first) await sleep(2500); // let the counter refill between pages
+    first = false;
+    let result;
+    try { result = await fetchKrakenProxy(proxyUrl, token, method, { ofs }); }
+    catch (e) {
+      if (/rate limit/i.test(e.message) && guard < 78) { await sleep(6000); guard++; continue; } // back off and retry this page
+      throw e;
+    }
     const batch = result[key] || {};
     const n = Object.keys(batch).length;
     Object.assign(all, batch);
