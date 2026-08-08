@@ -5,7 +5,7 @@ import {
   CheckCircle2, AlertTriangle, Landmark, Pencil, FileUp, Sparkles,
   Layers, Wand2, XCircle, Power, Zap, Coins as CoinsIcon, Wallet as WalletIcon,
   ArrowLeftRight, RefreshCw, Gauge, Building2, Settings as SettingsIcon, Languages, Scale,
-  ChevronRight, ChevronDown
+  ChevronRight, ChevronDown, Filter, Tag
 } from "lucide-react";
 
 // ---------- constants & seed data ----------
@@ -5488,6 +5488,7 @@ function TenantWorkspace({ tenantId, tenantName, tenants, seed, hasCrypto, onSwi
             onDeleteCryptoLabel={deleteCryptoLabel}
             cryptoRules={cryptoRules}
             cryptoFilters={cryptoFilters}
+            cryptoTxs={cryptoTxs}
             coins={coins}
             wallets={wallets}
             onAddRule={addAutoMapRule}
@@ -7338,7 +7339,7 @@ function legLabel(leg) {
   return `${prefix} ${leg.accountRef} (${pct === 100 ? baseField : `${pct}% of ${baseField}`})`;
 }
 
-function TransactionTypes({ accounts, cryptoLabels = [], onAddCryptoLabel, onUpdateCryptoLabel, onDeleteCryptoLabel, cryptoRules = [], cryptoFilters = [], coins = [], wallets = [], onAddRule, onDeleteRule }) {
+function TransactionTypes({ accounts, cryptoLabels = [], onAddCryptoLabel, onUpdateCryptoLabel, onDeleteCryptoLabel, cryptoRules = [], cryptoFilters = [], cryptoTxs = [], coins = [], wallets = [], onAddRule, onDeleteRule }) {
   const { t } = useLang();
   const autoMapRules = cryptoRules.filter((r) => Array.isArray(r.conditions) && r.conditions.length && r.labelId);
   const activeCryptoLabels = cryptoLabels.filter((l) => l.status !== "inactive");
@@ -7366,6 +7367,14 @@ function TransactionTypes({ accounts, cryptoLabels = [], onAddCryptoLabel, onUpd
       default: return `${c.field}=${c.value}`;
     }
   };
+  // Live "flow" counts: how many of the current transactions each filter/rule
+  // touches, so the transactions -> filtered -> label path is visible.
+  const filterCtx = { coins, wallets };
+  const isTradeLabel = (id) => cryptoLabels.find((l) => l.id === id)?.kind === "trade";
+  const matchingTxs = (conditions) => cryptoTxs.filter((tx) => matchesCryptoFilter(tx, conditions || [], filterCtx));
+  const countMatching = (conditions) => matchingTxs(conditions).length;
+  const countMapped = (conditions, labelId) => matchingTxs(conditions).filter((tx) => tx.matchedLabelId === labelId).length;
+  const previewCount = selectedFilter ? countMatching(selectedFilter.conditions) : 0;
   return (
     <div className="p-6 max-w-4xl">
       <h1 className="text-xl font-semibold text-black mb-1">{t("title_types")}</h1>
@@ -7383,9 +7392,17 @@ function TransactionTypes({ accounts, cryptoLabels = [], onAddCryptoLabel, onUpd
           ("Auto-map every transaction matching this filter to a label"). */}
       <div className="bg-white border border-stone-200 rounded-lg p-4 mb-5 shadow-sm">
         <div className="text-xs font-medium uppercase tracking-wide text-slate-400 mb-1">Auto-mapping rules</div>
-        <p className="text-xs text-slate-500 mb-3">
-          Match a saved filter to a label: every transaction matching that filter is mapped to the label automatically - both existing drafts in Needs Review and future imports. Save filters on the Crypto Transactions screen (Save favorite).
+        <p className="text-xs text-slate-500 mb-2">
+          Match a saved filter to a label: every transaction matching that filter is mapped to the label automatically - both existing drafts in Needs Review and future imports. This covers deposits, withdrawals, fees <span className="font-medium">and trades</span> (Type is Trade → a trade label). Save filters on the Crypto Transactions screen (Save favorite).
         </p>
+        {/* Visible flow: transactions -> filtered -> label. */}
+        <div className="flex items-center gap-2 mb-3 text-[11px]">
+          <span className="inline-flex items-center gap-1 bg-stone-100 text-slate-600 rounded-full px-2 py-0.5"><Layers size={11} />{cryptoTxs.length} transactions</span>
+          <span className="text-slate-300">→</span>
+          <span className="inline-flex items-center gap-1 bg-stone-100 text-slate-600 rounded-full px-2 py-0.5"><Filter size={11} />saved filter</span>
+          <span className="text-slate-300">→</span>
+          <span className="inline-flex items-center gap-1 bg-[#02B169]/10 text-[#02B169] rounded-full px-2 py-0.5"><Tag size={11} />label</span>
+        </div>
         {cryptoFilters.length === 0 ? (
           <div className="text-xs text-slate-400 mb-4 pb-4 border-b border-stone-100">No saved filters yet - create one on the Crypto Transactions screen (filter, then "Save favorite"), then match it to a label here.</div>
         ) : (
@@ -7402,7 +7419,7 @@ function TransactionTypes({ accounts, cryptoLabels = [], onAddCryptoLabel, onUpd
               <label className="block text-[11px] text-slate-500 mb-1">Label</label>
               <select value={rLabel} onChange={(e) => setRLabel(e.target.value)} className="w-full border border-stone-300 rounded px-2 py-1.5 text-sm">
                 <option value="">choose label…</option>
-                {activeCryptoLabels.map((l) => <option key={l.id} value={l.id}>{l.label}</option>)}
+                {activeCryptoLabels.map((l) => <option key={l.id} value={l.id}>{l.label}{l.kind === "trade" ? " (trade)" : ""}</option>)}
               </select>
             </div>
             <button onClick={addRule} disabled={!canAddRule}
@@ -7415,27 +7432,35 @@ function TransactionTypes({ accounts, cryptoLabels = [], onAddCryptoLabel, onUpd
           <div className="flex flex-wrap items-center gap-1 mb-4 pb-4 border-b border-stone-100 text-xs text-slate-500">
             <span className="text-slate-400">Matches:</span>
             {(selectedFilter.conditions || []).map((c, i) => <span key={i} className="bg-stone-100 text-slate-600 rounded px-1.5 py-0.5">{condText(c)}</span>)}
+            <span className="text-slate-300">→</span>
+            <span className="inline-flex items-center gap-1 bg-[#02B169]/10 text-[#02B169] font-medium rounded-full px-2 py-0.5">{previewCount} of {cryptoTxs.length} transactions</span>
           </div>
         )}
         {autoMapRules.length === 0 ? (
           <div className="text-xs text-slate-400">No auto-mapping rules yet.</div>
         ) : (
           <div className="divide-y divide-stone-100">
-            {autoMapRules.map((r) => (
+            {autoMapRules.map((r) => {
+              const total = countMatching(r.conditions);
+              const mapped = countMapped(r.conditions, r.labelId);
+              return (
               <div key={r.id} className="flex items-center gap-2 py-2 text-sm">
                 <div className="flex-1 min-w-0 flex flex-wrap items-center gap-1">
                   {r.filterName && <span className="text-xs font-medium text-slate-700">{r.filterName}</span>}
                   {r.conditions.map((c, i) => (
                     <span key={i} className="text-xs bg-stone-100 text-slate-600 rounded px-1.5 py-0.5">{condText(c)}</span>
                   ))}
+                  <span className="inline-flex items-center gap-1 text-[11px] text-slate-500 bg-stone-50 border border-stone-200 rounded-full px-1.5 py-0.5" title="Transactions currently matching this filter, and how many are mapped to the label">{mapped}/{total} mapped</span>
                   <span className="text-slate-400 mx-1">→</span>
                   <span className="text-xs font-medium text-[#02B169]">{cryptoLabels.find((l) => l.id === r.labelId)?.label || "(deleted label)"}</span>
+                  {isTradeLabel(r.labelId) && <span className="text-[10px] font-medium text-indigo-600 bg-indigo-50 rounded-full px-1.5 py-0.5">Trade</span>}
                 </div>
                 {onDeleteRule && (
                   <button onClick={() => onDeleteRule(r.id)} className="text-slate-300 hover:text-[#B91C1C] shrink-0" title="Remove rule"><Trash2 size={14} /></button>
                 )}
               </div>
-            ))}
+              );
+            })}
           </div>
         )}
       </div>
