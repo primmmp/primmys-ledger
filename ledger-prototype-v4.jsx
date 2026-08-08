@@ -4470,7 +4470,22 @@ function TenantWorkspace({ tenantId, tenantName, tenants, seed, hasCrypto, onSwi
   // lastSyncedAt}) and the block-explorer API keys used to fetch them. Keys are
   // stored per-tenant alongside the rest of the books.
   const [gasTanks, setGasTanks] = useState(DEFAULT_GAS_TANKS);
-  const [explorerKeys, setExplorerKeys] = useState({ etherscan: "", tronscan: "", coingecko: "", krakenUrl: "", krakenToken: "" });
+  // API keys persist per-company in localStorage. Read synchronously in the
+  // initializer so the state is *never* empty-then-loaded - that transient is
+  // what let a save fire before the load landed and wipe the saved keys (the
+  // Kraken proxy URL kept disappearing on reload). tenantId is stable for this
+  // component instance (it's remounted per tenant via React key), so reading it
+  // here is safe.
+  const explorerKeysKey = `ledger-explorer-keys-${tenantId}`;
+  const [explorerKeys, setExplorerKeys] = useState(() => {
+    const blank = { etherscan: "", tronscan: "", coingecko: "", krakenUrl: "", krakenToken: "" };
+    try {
+      const v = typeof localStorage !== "undefined" ? localStorage.getItem(explorerKeysKey) : null;
+      const p = v ? JSON.parse(v) : null;
+      if (p && typeof p === "object") return { ...blank, etherscan: p.etherscan || "", tronscan: p.tronscan || "", coingecko: p.coingecko || "", krakenUrl: p.krakenUrl || "", krakenToken: p.krakenToken || "" };
+    } catch { /* ignore */ }
+    return blank;
+  });
   // Client withdrawal fee schedule (flat fee per coin) - carved out of each
   // client withdrawal and booked to fee revenue.
   const [withdrawFees, setWithdrawFees] = useState(DEFAULT_WITHDRAW_FEES);
@@ -4554,25 +4569,13 @@ function TenantWorkspace({ tenantId, tenantName, tenants, seed, hasCrypto, onSwi
     });
   }, [storageKey, accounts, entities, rules, registry, coins, wallets, cryptoRules, cryptoLabels, cryptoFilters, walletLabelRules, gasTanks, withdrawFees, lockDate, ready]);
 
-  // API keys are the one thing that should survive a reload (they're annoying to
-  // re-enter), even though transactions and other books intentionally don't.
-  // So they persist on their own in the browser's localStorage, keyed per
-  // company - independent of the window.storage path everything else uses.
-  const explorerKeysKey = `ledger-explorer-keys-${tenantId}`;
+  // Persist API keys on every change. No `ready` gate and no separate load
+  // effect: the state is seeded from localStorage in the useState initializer
+  // above, so the initial value already IS the saved value - this write-back is
+  // a no-op on mount and can never clobber the saved keys with a transient empty.
   useEffect(() => {
-    try {
-      const v = typeof localStorage !== "undefined" ? localStorage.getItem(explorerKeysKey) : null;
-      const parsed = v ? JSON.parse(v) : null;
-      setExplorerKeys(parsed && typeof parsed === "object"
-        ? { etherscan: parsed.etherscan || "", tronscan: parsed.tronscan || "", coingecko: parsed.coingecko || "", krakenUrl: parsed.krakenUrl || "", krakenToken: parsed.krakenToken || "" }
-        : { etherscan: "", tronscan: "", coingecko: "", krakenUrl: "", krakenToken: "" });
-    } catch { /* ignore */ }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [tenantId]);
-  useEffect(() => {
-    if (!ready) return;
     try { if (typeof localStorage !== "undefined") localStorage.setItem(explorerKeysKey, JSON.stringify(explorerKeys)); } catch { /* best-effort */ }
-  }, [explorerKeys, explorerKeysKey, ready]);
+  }, [explorerKeys, explorerKeysKey]);
 
   // Once loaded, drop any zero-principal crypto transactions already sitting
   // in the ledger (fee-only import artifacts). They can never post, so this
