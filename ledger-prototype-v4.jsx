@@ -5463,11 +5463,11 @@ function TenantWorkspace({ tenantId, tenantName, tenants, seed, hasCrypto, onSwi
         {hasCrypto && tab === "wallets" && (
           <WalletsScreen wallets={wallets} accounts={accounts} onAdd={addWallet} onUpdate={updateWallet} onDelete={deleteWallet} />
         )}
-        {hasCrypto && tab === "gasTanks" && (
-          <GasTanksScreen
-            gasTanks={gasTanks} wallets={wallets}
-            onAdd={addGasTank} onUpdate={updateGasTank} onRemove={removeGasTank}
-            onSync={syncGasTanks}
+        {hasCrypto && tab === "dataSources" && (
+          <DataSourcesScreen
+            wallets={wallets} walletLabelRules={walletLabelRules} onImport={importCryptoCsvHandler}
+            gasTanks={gasTanks} onAddGasTank={addGasTank} onUpdateGasTank={updateGasTank} onRemoveGasTank={removeGasTank} onSyncGasTanks={syncGasTanks}
+            krakenReady={!!(explorerKeys.krakenUrl || "").trim()} onSyncKraken={syncKraken}
           />
         )}
         {hasCrypto && tab === "cryptoTx" && (
@@ -8233,6 +8233,58 @@ const COMPLIANCE_STATUSES = ["Verified", "Pending Review", "Flagged"];
 
 // Gas-tank manager: register a fee-wallet address per chain and pull its
 // on-chain native activity straight from the block explorer (Etherscan V2 for
+// Data Sources hub (Cryptio-style): every way crypto activity comes in - file
+// imports, on-chain gas tanks, and exchange syncs - under one screen with a
+// source picker. Only shown for crypto companies (it's in the Crypto nav group).
+function DataSourcesScreen({ wallets, walletLabelRules, onImport, gasTanks, onAddGasTank, onUpdateGasTank, onRemoveGasTank, onSyncGasTanks, krakenReady, onSyncKraken }) {
+  const { t } = useLang();
+  const [src, setSrc] = useState("file");
+  return (
+    <div>
+      <div className="px-6 pt-6 pb-0 max-w-5xl">
+        <h1 className="text-xl font-semibold text-black mb-1">{t("title_dataSources")}</h1>
+        <p className="text-sm text-slate-500 mb-4">{t("subtitle_dataSources")}</p>
+        <div className="flex gap-1 border-b border-stone-200">
+          {[["file", "File import"], ["gastanks", "Gas tanks"], ["kraken", "Kraken"]].map(([k, l]) => (
+            <button key={k} onClick={() => setSrc(k)}
+              className={`px-3 py-2 text-sm border-b-2 -mb-px ${src === k ? "border-[#03D47C] text-[#02B169] font-medium" : "border-transparent text-slate-500 hover:text-slate-700"}`}>
+              {l}
+            </button>
+          ))}
+        </div>
+      </div>
+      {src === "file" && <div className="p-6 max-w-5xl"><CryptoImportScreen wallets={wallets} walletLabelRules={walletLabelRules} onImport={onImport} /></div>}
+      {src === "gastanks" && <GasTanksScreen gasTanks={gasTanks} wallets={wallets} onAdd={onAddGasTank} onUpdate={onUpdateGasTank} onRemove={onRemoveGasTank} onSync={onSyncGasTanks} />}
+      {src === "kraken" && <div className="p-6 max-w-3xl"><KrakenSource ready={krakenReady} onSync={onSyncKraken} /></div>}
+    </div>
+  );
+}
+
+// One exchange source card: syncs Kraken trades + ledgers through the proxy.
+function KrakenSource({ ready, onSync }) {
+  const [busy, setBusy] = useState(false);
+  const [result, setResult] = useState(null);
+  async function run() {
+    setBusy(true); setResult(null);
+    try { setResult(await onSync()); } catch (e) { setResult({ error: e.message || String(e) }); } finally { setBusy(false); }
+  }
+  return (
+    <div className="bg-white border border-stone-200 rounded-lg p-4 shadow-sm">
+      <div className="flex items-center justify-between gap-3 mb-2">
+        <h2 className="text-sm font-semibold text-black">Kraken</h2>
+        <button onClick={run} disabled={busy || !ready}
+          className="flex items-center gap-1.5 bg-black enabled:hover:bg-[#4D4D4D] disabled:opacity-40 text-white text-sm px-3 py-1.5 rounded-full">
+          <RefreshCw size={14} className={busy ? "animate-spin" : ""} /> {busy ? "Syncing…" : "Sync Kraken"}
+        </button>
+      </div>
+      <p className="text-xs text-slate-500">Pulls your trade history and ledger (deposits/withdrawals) through your signing proxy. Trades import as Trade transactions; deposits and withdrawals land in Crypto Transactions › Needs review. Re-syncing skips anything already imported.</p>
+      {!ready && <p className="text-xs text-rose-600 mt-2">Add the Kraken proxy URL in Settings › Crypto first.</p>}
+      {result && !result.error && <p className="text-xs text-[#02B169] mt-2">Imported {result.trades} trade{result.trades === 1 ? "" : "s"} and {result.deposits} deposit/withdrawal{result.deposits === 1 ? "" : "s"}{result.dupes ? `, ${result.dupes} already imported` : ""}.</p>}
+      {result?.error && <p className="text-xs text-rose-600 mt-2">{result.error}</p>}
+    </div>
+  );
+}
+
 // EVM chains, TronScan for Tron), importing top-ups as Deposits and gas spends
 // as Fees. Each tank remembers a cursor (last block / timestamp) so Sync only
 // fetches new activity. Fetching runs in the browser and needs an API key.
